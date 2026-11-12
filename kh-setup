@@ -1,0 +1,253 @@
+#!/bin/sh
+# kh-setup: one command from a fresh macOS or Linux machine to the karkhana setup stage.
+#
+# This file is published byte for byte to the public tap,
+# https://github.com/sastaticket/homebrew-karkhana, so it must hold no private value: only the
+# two repos it clones by name, only public download addresses, no host names, no home paths.
+# scripts/tap-lint.py checks that on every change (make check-tree, CI).
+#
+# What it does, checking everything before it changes anything:
+#   1. checks the OS, tmux, python3, git, the GitHub CLI and its login;
+#   2. reads pins.env (beside this script, or from the tap) for the bd and dolt versions;
+#   3. with Homebrew, checks the tap installed bd and dolt at those versions; without it,
+#      downloads both, verifies their sha256 against pins.env, then installs them to
+#      ~/.local/bin;
+#   4. clones the workspace and karkhana with `gh repo clone` (the engineer's own login);
+#   5. hands every other argument to karkhana's scripts/setup-machine.sh.
+# It never installs the city engine: the setup stage does that through `make upgrade-gc`.
+#
+# POSIX sh only; runs on macOS and Linux (ADR 023).
+set -eu
+
+TAP_RAW=https://github.com/sastaticket/homebrew-karkhana/raw/HEAD
+REPO_DEFAULT=sastaticket/karkhana
+WORKSPACE_REPO_DEFAULT=sastaticket/sastaticket-docker
+BIN="$HOME/.local/bin"
+
+say() { printf '%s\n' "kh-setup: $*" >&2; }
+die() { say "$@"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: kh-setup [--workspace <dir>] [--repo <owner/name>] [--workspace-repo <owner/name>] [setup options]
+
+Sets this machine up to run karkhana: checks the prerequisites, installs bd and dolt,
+clones the workspace and karkhana, then runs karkhana's setup stage.
+
+  --workspace <dir>              where sastaticket-docker and karkhana live (default: the
+                                 current directory when it holds sastaticket-docker, else asked)
+  --repo <owner/name>            the karkhana repo to clone (default sastaticket/karkhana)
+  --workspace-repo <owner/name>  the workspace repo to clone (default sastaticket/sastaticket-docker)
+  -h, --help                     show this help
+
+Any other option (for example --ledger-bundle <zip>) is passed to the setup stage.
+EOF
+}
+
+usage_error() {
+  say "$1"
+  usage >&2
+  exit 2
+}
+
+# --- arguments: consume our own flags, keep every other argument in order -------------------
+WORKSPACE=""
+REPO=$REPO_DEFAULT
+WORKSPACE_REPO=$WORKSPACE_REPO_DEFAULT
+n=$#
+while [ "$n" -gt 0 ]; do
+  arg=$1
+  shift
+  n=$((n - 1))
+  case $arg in
+    --workspace|--repo|--workspace-repo)
+      [ "$n" -gt 0 ] || usage_error "$arg needs a value"
+      val=$1
+      shift
+      n=$((n - 1))
+      case $arg in
+        --workspace) WORKSPACE=$val ;;
+        --repo) REPO=$val ;;
+        --workspace-repo) WORKSPACE_REPO=$val ;;
+      esac
+      ;;
+    --workspace=*) WORKSPACE=${arg#*=} ;;
+    --repo=*) REPO=${arg#*=} ;;
+    --workspace-repo=*) WORKSPACE_REPO=${arg#*=} ;;
+    -h|--help) usage; exit 0 ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+
+# No flag, no sastaticket-docker here and nobody to ask: say so before anything is downloaded.
+if [ -z "$WORKSPACE" ] && [ ! -d "$PWD/sastaticket-docker" ] && [ ! -t 0 ]; then
+  usage_error "no workspace given. Run: kh-setup --workspace <dir> [setup options]"
+fi
+
+# --- platform ----------------------------------------------------------------------------------
+os_name=$(uname -s)
+case $os_name in
+  Darwin) OS=DARWIN ;;
+  Linux) OS=LINUX ;;
+  *) die "unsupported OS '$os_name': macOS and Linux only" ;;
+esac
+arch_name=$(uname -m)
+case $arch_name in
+  x86_64|amd64) ARCH=AMD64 ;;
+  arm64|aarch64) ARCH=ARM64 ;;
+  *) die "unsupported CPU '$arch_name': amd64 and arm64 only" ;;
+esac
+
+# The install line for this OS: install_line <macOS line> <Linux line>
+install_line() {
+  if [ "$OS" = DARWIN ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+
+# --- prerequisites: checked, never installed ---------------------------------------------------
+missing=""
+command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
+command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+if [ -n "$missing" ]; then
+  die "missing:$missing. Install them: $(install_line 'brew install tmux python@3.12' 'sudo apt-get install tmux python3-yaml')"
+fi
+command -v git >/dev/null 2>&1 ||
+  die "git is missing. Install it: $(install_line 'xcode-select --install' 'sudo apt-get install git')"
+command -v gh >/dev/null 2>&1 ||
+  die "the GitHub CLI (gh) is missing. Install it: $(install_line 'brew install gh' 'sudo apt-get install gh')"
+gh auth status >/dev/null 2>&1 ||
+  die "you are not logged in to GitHub. Run: gh auth login"
+
+need_curl() {
+  command -v curl >/dev/null 2>&1 ||
+    die "curl is missing. Install it: $(install_line 'brew install curl' 'sudo apt-get install curl')"
+}
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/kh-setup.XXXXXX")
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+# --- pins.env: read, never run -----------------------------------------------------------------
+here=$(cd "$(dirname "$0")" && pwd)
+if [ -r "$here/pins.env" ]; then
+  PINS="$here/pins.env"
+elif [ -r "$here/../share/kh-setup/pins.env" ]; then
+  PINS="$here/../share/kh-setup/pins.env"
+else
+  need_curl
+  PINS="$TMP/pins.env"
+  curl -fsSL "$TAP_RAW/pins.env" -o "$PINS" 2>/dev/null ||
+    die "could not read pins.env (looked beside kh-setup and at $TAP_RAW/pins.env). Check your network, or reinstall: brew reinstall sastaticket/karkhana/kh-setup"
+fi
+
+# pin KEY: the value of KEY=value in pins.env; a missing or empty key stops the run.
+pin() {
+  v=$(sed -n "s/^$1=//p" "$PINS" | head -n 1 | tr -d '\r')
+  [ -n "$v" ] || die "pins.env has no $1. Reinstall: brew reinstall sastaticket/karkhana/kh-setup"
+  printf '%s' "$v"
+}
+
+# reports_pin <command> <version>: the command's `version` first line names that version.
+reports_pin() {
+  first=$("$1" version 2>/dev/null | head -n 1) || first=""
+  re=$(printf '%s' "$2" | sed 's/\./\\./g')
+  printf '%s\n' "$first" | grep -Eq "(^|[^0-9.])${re}([^0-9.]|\$)"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1 # portable: GNU then BSD
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1 # portable: GNU then BSD
+  else
+    die "no sha256 tool found. Install it: $(install_line 'xcode-select --install' 'sudo apt-get install coreutils')"
+  fi
+}
+
+# --- bd and dolt -------------------------------------------------------------------------------
+BD_VERSION=$(pin BD_VERSION)
+DOLT_VERSION=$(pin DOLT_VERSION)
+
+if command -v brew >/dev/null 2>&1; then
+  # The tap's formulas install bd and dolt; nothing is downloaded here.
+  for t in bd dolt; do
+    command -v "$t" >/dev/null 2>&1 ||
+      die "$t is missing. Install it: brew install sastaticket/karkhana/kh-setup"
+  done
+  if ! reports_pin bd "$BD_VERSION" || ! reports_pin dolt "$DOLT_VERSION"; then
+    die "bd or dolt is not at the pinned version (bd $BD_VERSION, dolt $DOLT_VERSION). Replace them: brew uninstall beads dolt && brew install sastaticket/karkhana/kh-setup"
+  fi
+else
+  todo=""
+  if ! reports_pin "$BIN/bd" "$BD_VERSION"; then todo="$todo bd"; fi
+  if ! reports_pin "$BIN/dolt" "$DOLT_VERSION"; then todo="$todo dolt"; fi
+  if [ -n "$todo" ]; then
+    need_curl
+    # Download and verify every artifact before installing any of them.
+    for t in $todo; do
+      T=$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')
+      url=$(pin "${T}_URL_${OS}_${ARCH}")
+      want=$(pin "${T}_SHA256_${OS}_${ARCH}")
+      curl -fsSL "$url" -o "$TMP/$t.tar.gz" ||
+        die "could not download $t from $url. Check your network and run kh-setup again"
+      got=$(sha256_of "$TMP/$t.tar.gz")
+      [ "$got" = "$want" ] ||
+        die "$t download does not match pins.env (expected $want, got $got). Nothing was installed. Try again later; if it persists, the release changed upstream."
+    done
+    for t in $todo; do
+      mkdir "$TMP/$t"
+      tar -xzf "$TMP/$t.tar.gz" -C "$TMP/$t" ||
+        die "could not unpack the $t download. Run kh-setup again"
+      found=$(find "$TMP/$t" -type f -name "$t" | head -n 1)
+      [ -n "$found" ] || die "the $t download holds no $t binary. Try again later; the release layout changed upstream."
+      mkdir -p "$BIN"
+      cp "$found" "$BIN/$t.new"
+      chmod 755 "$BIN/$t.new"
+      mv -f "$BIN/$t.new" "$BIN/$t"
+      say "installed $t to $BIN"
+    done
+  fi
+  case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *)
+      # shellcheck disable=SC2016 # the line is printed for the engineer to paste, unexpanded
+      say '$HOME/.local/bin is not on your PATH. Add it: echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.profile'
+      PATH="$BIN:$PATH"
+      export PATH
+      ;;
+  esac
+fi
+
+# --- workspace ---------------------------------------------------------------------------------
+if [ -z "$WORKSPACE" ]; then
+  if [ -d "$PWD/sastaticket-docker" ]; then
+    WORKSPACE=$PWD
+  else
+    printf 'Where should the workspace live? It will hold sastaticket-docker and karkhana. [%s]: ' "$PWD" >&2
+    read -r WORKSPACE || WORKSPACE=""
+    [ -n "$WORKSPACE" ] || WORKSPACE=$PWD
+  fi
+fi
+mkdir -p "$WORKSPACE" || die "could not create $WORKSPACE. Choose another: kh-setup --workspace <dir>"
+WORKSPACE=$(cd "$WORKSPACE" && pwd)
+
+# --- clones: the engineer's own GitHub login, by repo name only ---------------------------------
+clone() {
+  if [ -e "$2" ]; then
+    say "$2 already there, not cloning"
+    return 0
+  fi
+  gh repo clone "$1" "$2" ||
+    die "could not clone $1. Check you have access to it on GitHub (gh repo view $1), then run kh-setup again"
+}
+clone "$WORKSPACE_REPO" "$WORKSPACE/sastaticket-docker"
+clone "$REPO" "$WORKSPACE/karkhana"
+
+# --- hand-off ----------------------------------------------------------------------------------
+stage="$WORKSPACE/karkhana/scripts/setup-machine.sh"
+[ -x "$stage" ] ||
+  die "$WORKSPACE/karkhana has no scripts/setup-machine.sh yet. Update it: git -C $WORKSPACE/karkhana pull, then run kh-setup again"
+cleanup
+trap - EXIT INT TERM
+cd "$WORKSPACE/karkhana"
+exec "$stage" "$@"

@@ -1,11 +1,11 @@
-# Written by karkhana's tap workflow (scripts/stamp-tap.py) from versions.env at karkhana-v1.0.0.
+# Written by karkhana's tap workflow (scripts/stamp-tap.py) from versions.env at karkhana-v2.0.0.
 # Do not edit in the tap: the next GA overwrites it.
 class KhSetup < Formula
   desc "One command from a fresh machine to the karkhana setup stage"
   homepage "https://github.com/sastaticket/homebrew-karkhana"
-  url "https://raw.githubusercontent.com/sastaticket/homebrew-karkhana/main/dist/kh-setup-karkhana-v1.0.0.tar.gz"
-  version "1.0.0"
-  sha256 "73de14677cdeebb6e08a53483591f9aafe84b80acc4b8d54b290e00e5c4ca63f"
+  url "https://raw.githubusercontent.com/sastaticket/homebrew-karkhana/main/dist/kh-setup-karkhana-v2.0.0.tar.gz"
+  version "2.0.0"
+  sha256 "3a415afbdc1f2d04333ee48319e304103bcc3134afe2279470dc1515cd476e53"
 
   depends_on "sastaticket/karkhana/karkhana-bd"
   depends_on "sastaticket/karkhana/karkhana-dolt"

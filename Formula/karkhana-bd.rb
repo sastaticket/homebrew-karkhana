@@ -1,4 +1,4 @@
-# Written by karkhana's tap workflow (scripts/stamp-tap.py) from versions.env at karkhana-v1.0.0.
+# Written by karkhana's tap workflow (scripts/stamp-tap.py) from versions.env at karkhana-v2.0.0.
 # Do not edit in the tap: the next GA overwrites it.
 class KarkhanaBd < Formula
   desc "bd (beads) at the version the karkhana factory pins"

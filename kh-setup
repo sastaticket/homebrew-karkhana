@@ -7,7 +7,8 @@
 # scripts/tap-lint.py checks that on every change (make check-tree, CI).
 #
 # What it does, checking everything before it changes anything:
-#   1. checks the OS, tmux, python3, git, the GitHub CLI and its login;
+#   1. checks the OS, tmux, python3, git, age and the GitHub CLI, and its login: logged out with
+#      a terminal, it runs `gh auth login` (the tap's formula installs tmux, python and gh);
 #   2. reads pins.env (beside this script, or from the tap) for the bd and dolt versions;
 #   3. with Homebrew, checks the tap installed bd and dolt at those versions; without it,
 #      downloads both, verifies their sha256 against pins.env, then installs them to
@@ -40,7 +41,8 @@ clones the workspace and karkhana, then runs karkhana's setup stage.
   --workspace-repo <owner/name>  the workspace repo to clone (default sastaticket/sastaticket-docker)
   -h, --help                     show this help
 
-Any other option (for example --ledger-bundle <zip>) is passed to the setup stage.
+Any other option (for example --ledger-bundle <zip>, or --new-ledger-key to make a new ledger
+key and open the pull request that carries it) is passed to the setup stage.
 EOF
 }
 
@@ -104,9 +106,17 @@ install_line() {
 }
 
 # --- prerequisites: checked, never installed ---------------------------------------------------
+# With Homebrew the formula has installed tmux, python@3.12 and gh already; these lines are for a
+# machine without it. Homebrew's python@3.12 is python3.12 only, with no python3 beside it.
+has_python() {
+  for p in python3.13 python3.12 python3.11 python3; do
+    command -v "$p" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 missing=""
 command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
-command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+has_python || missing="$missing python3"
 if [ -n "$missing" ]; then
   die "missing:$missing. Install them: $(install_line 'brew install tmux python@3.12' 'sudo apt-get install tmux python3-yaml')"
 fi
@@ -114,8 +124,17 @@ command -v git >/dev/null 2>&1 ||
   die "git is missing. Install it: $(install_line 'xcode-select --install' 'sudo apt-get install git')"
 command -v gh >/dev/null 2>&1 ||
   die "the GitHub CLI (gh) is missing. Install it: $(install_line 'brew install gh' 'sudo apt-get install gh')"
-gh auth status >/dev/null 2>&1 ||
-  die "you are not logged in to GitHub. Run: gh auth login"
+# Logged out: with a terminal, log in here (gh asks its own questions); without one, say how.
+if ! gh auth status >/dev/null 2>&1; then
+  [ -t 0 ] || die "you are not logged in to GitHub. Run: gh auth login"
+  say "you are not logged in to GitHub: running gh auth login"
+  gh auth login || die "gh auth login did not finish. Run: gh auth login, then kh-setup again"
+  gh auth status >/dev/null 2>&1 ||
+    die "still not logged in to GitHub. Run: gh auth login, then kh-setup again"
+fi
+# age makes the ledger key on this machine and opens the bundle sent for it.
+{ command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; } ||
+  die "age is missing. Install it: $(install_line 'brew install age' 'sudo apt-get install age')"
 
 need_curl() {
   command -v curl >/dev/null 2>&1 ||
